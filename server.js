@@ -6,6 +6,7 @@ const { JpegParts } = require('./stream');
 
 const PROFILE = Object.freeze({ width: 640, height: 480, fps: 10 });
 const CAMERA_ID = /^usb-[a-f0-9]{32}$/;
+const VIEWER_ID = /^[a-f0-9]{32}$/;
 const BOUNDARY = 'orenda-camera';
 const MAX_VIEWERS = 8;
 const MAX_QUEUED_BYTES = 1024 * 1024;
@@ -33,9 +34,27 @@ function cameraError(error) {
   return { status, message: messages[status] };
 }
 
-function createApp({ runtime = createRuntimeClient(), secret = process.env.ORENDA_EDGE_APP_PROXY_SECRET } = {}) {
+function createApp({ runtime = createRuntimeClient(), secret = process.env.ORENDA_EDGE_APP_PROXY_SECRET, viewerLeaseMs = 15000 } = {}) {
+  if (!Number.isInteger(viewerLeaseMs) || viewerLeaseMs < 1 || viewerLeaseMs > 15000) throw new Error('Invalid viewer lease');
   const hubs = new Map();
   const failures = new Map();
+  const viewers = new Map();
+  const responseViewers = new WeakMap();
+  const closedViewers = new Map();
+  const ownerOf = (user) => JSON.stringify([user.source, user.id]);
+  function rememberClosed(id) {
+    const now = Date.now();
+    for (const [key, until] of closedViewers) if (until <= now) closedViewers.delete(key);
+    if (closedViewers.size >= 128) closedViewers.delete(closedViewers.keys().next().value);
+    closedViewers.set(id, now + 15000);
+  }
+  function releaseViewer(viewer) {
+    if (viewers.get(viewer.id) === viewer) viewers.delete(viewer.id);
+    rememberClosed(viewer.id);
+    viewer.hub.clients.delete(viewer.res);
+    viewer.res.destroy();
+    if (!viewer.hub.clients.size) stopHub(viewer.hub);
+  }
   const json = (res, status, body) => {
     if (res.destroyed || res.writableEnded) return;
     res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
@@ -48,6 +67,8 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
     clearInterval(hub.watchdog);
     if (hubs.get(hub.id) === hub) hubs.delete(hub.id);
     for (const res of hub.clients) {
+      const viewer = responseViewers.get(res);
+      if (viewer) { if (viewers.get(viewer.id) === viewer) viewers.delete(viewer.id); rememberClosed(viewer.id); }
       if (hub.failure && !res.headersSent) json(res, hub.failure.status, { error: hub.failure.message });
       else res.destroy();
     }
@@ -95,6 +116,11 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
       });
     }).catch((error) => { recordFailure(hub, error); throw error; });
     hub.watchdog = setInterval(() => {
+      for (const res of hub.clients) {
+        const viewer = responseViewers.get(res);
+        if (viewer && viewer.expiresAt <= Date.now()) releaseViewer(viewer);
+      }
+      if (hub.stopped) return;
       if (Date.now() - (hub.lastFrameAt || hub.startedAt) > 15000) recordFailure(hub, { status: 504 });
     }, 1000);
     hub.watchdog.unref();
@@ -106,6 +132,18 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
       if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true });
       const user = authenticateEdgeRequest(req.headers, secret);
       if (!user) return json(res, 401, { error: 'Open this app from Edge Console to continue.' });
+      const stopRoute = /^\/api\/viewers\/([^/]+)\/stop$/.exec(url.pathname);
+      if (req.method === 'POST' && stopRoute) {
+        const viewerId = stopRoute[1];
+        if (!VIEWER_ID.test(viewerId)) return json(res, 400, { error: 'Invalid viewer.' });
+        const viewer = viewers.get(viewerId);
+        if (viewer && viewer.owner !== ownerOf(user)) return json(res, 404, { error: 'Viewer not found.' });
+        if (viewer) releaseViewer(viewer);
+        else rememberClosed(viewerId);
+        req.resume();
+        res.writeHead(204, { 'Cache-Control': 'no-store' });
+        return res.end();
+      }
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed.' });
       if (url.pathname === '/api/session') return json(res, 200, { user });
       if (url.pathname === '/api/cameras') {
@@ -119,16 +157,31 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
         const id = url.searchParams.get('camera');
         if (!CAMERA_ID.test(id || '')) return json(res, 400, { error: 'Choose an approved camera.' });
         if (url.pathname === '/api/status') {
+          const viewerId = url.searchParams.get('viewer');
+          if (viewerId !== null) {
+            if (!VIEWER_ID.test(viewerId)) return json(res, 400, { error: 'Invalid viewer.' });
+            const viewer = viewers.get(viewerId);
+            if (viewer && (viewer.owner !== ownerOf(user) || viewer.hub.id !== id)) return json(res, 404, { error: 'Viewer not found.' });
+            if (!viewer) return json(res, 200, { state: 'idle', error: failures.get(id)?.message || null });
+            if (viewer.expiresAt <= Date.now()) { releaseViewer(viewer); return json(res, 200, { state: 'idle', error: null }); }
+            viewer.expiresAt = Date.now() + viewerLeaseMs;
+          }
           const hub = hubs.get(id);
           const failure = failures.get(id);
           return json(res, 200, { state: failure ? 'error' : hub?.lastFrameAt ? 'live' : hub ? 'connecting' : 'idle', error: failure?.message || null });
         }
         try {
+          const viewerId = url.searchParams.get('viewer');
+          if (!VIEWER_ID.test(viewerId || '')) return json(res, 400, { error: 'Invalid viewer.' });
+          if (viewers.has(viewerId) || (closedViewers.get(viewerId) || 0) > Date.now()) return json(res, 409, { error: 'This viewer has closed or is already open. Start video again.' });
           const hub = getHub(id);
           if (hub.clients.size >= MAX_VIEWERS) return json(res, 429, { error: cameraError({ status: 429 }).message });
           // Reserve before awaiting the camera so simultaneous joins remain bounded.
+          const viewer = { id: viewerId, owner: ownerOf(user), hub, res, expiresAt: Date.now() + viewerLeaseMs };
+          viewers.set(viewerId, viewer);
+          responseViewers.set(res, viewer);
           hub.clients.add(res);
-          res.once('close', () => { hub.clients.delete(res); if (!hub.clients.size) stopHub(hub); });
+          res.once('close', () => releaseViewer(viewer));
           await hub.ready;
           if (res.destroyed || hub.stopped) return;
           res.writeHead(200, { 'Content-Type': `multipart/x-mixed-replace; boundary=${BOUNDARY}`, 'Cache-Control': 'no-store, no-cache, must-revalidate', 'X-Accel-Buffering': 'no', 'X-Content-Type-Options': 'nosniff' });

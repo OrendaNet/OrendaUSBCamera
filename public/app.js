@@ -9,6 +9,7 @@ const title = document.getElementById('screen-title');
 const detail = document.getElementById('screen-detail');
 let selected = '';
 let playing = false;
+let activeViewer = '';
 let wanted = true;
 let generation = 0;
 let checking = false;
@@ -22,12 +23,20 @@ function message(state, label, text, heading = label) {
   detail.textContent = text;
 }
 function stop() {
+  const closingViewer = activeViewer;
+  activeViewer = '';
   playing = false;
   clearTimeout(poll);
-  video.removeAttribute('src');
+  // Replace the displayed frame locally without making another HTTP request.
+  video.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
   video.hidden = true;
   placeholder.hidden = false;
   toggle.textContent = 'Start video';
+  if (closingViewer) {
+    // Some browsers retain the MJPEG request after the image changes. Close
+    // only this viewer; a short server lease also covers interrupted exits.
+    fetch(`api/viewers/${closingViewer}/stop`, { method: 'POST', keepalive: true, cache: 'no-store' }).catch(() => {});
+  }
 }
 async function api(route) {
   const response = await fetch(route, { cache: 'no-store', signal: AbortSignal.timeout(12000) });
@@ -43,7 +52,7 @@ function fail(text) {
 async function checkState(ticket) {
   if (!playing || ticket !== generation) return;
   try {
-    const result = await api(`api/status?camera=${encodeURIComponent(selected)}`);
+    const result = await api(`api/status?camera=${encodeURIComponent(selected)}&viewer=${activeViewer}`);
     if (!playing || ticket !== generation) return;
     if (result.state === 'error' || result.state === 'idle') return fail(result.error || 'The stream stopped. Try again to reconnect.');
     if (result.state === 'live') {
@@ -58,10 +67,11 @@ function start() {
   stop();
   if (!selected || document.hidden) return;
   const ticket = ++generation;
+  activeViewer = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('');
   playing = true;
   toggle.textContent = 'Pause video';
   message('connecting', 'Connecting', 'Waiting for the first camera frame…', 'Starting your camera');
-  video.src = `api/stream?camera=${encodeURIComponent(selected)}&view=${ticket}`;
+  video.src = `api/stream?camera=${encodeURIComponent(selected)}&viewer=${activeViewer}&view=${ticket}`;
   poll = setTimeout(() => checkState(ticket), 1000);
 }
 async function loadCameras() {
@@ -102,7 +112,16 @@ toggle.addEventListener('click', () => {
 });
 camera.addEventListener('change', () => { selected = camera.value; wanted = true; start(); });
 refresh.addEventListener('click', loadCameras);
-video.addEventListener('error', () => { if (playing) checkState(generation); });
+video.addEventListener('error', async () => {
+  if (!playing) return;
+  const ticket = generation;
+  let reason = 'Video could not be displayed. Close another viewer or try again.';
+  try {
+    const result = await api(`api/status?camera=${encodeURIComponent(selected)}&viewer=${activeViewer}`);
+    if (result.error) reason = result.error;
+  } catch (error) { reason = error.message; }
+  if (playing && ticket === generation) fail(reason);
+});
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { ++generation; stop(); message('idle', 'Paused', 'Video pauses while this page is in the background.'); }
   else if (wanted && selected) start();

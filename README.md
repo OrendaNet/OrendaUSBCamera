@@ -46,6 +46,8 @@ The manifest requests only `usb:read`. An administrator selects the device's sta
 
 The app relays complete JPEG frames as an HTTP multipart stream. Multiple viewers share one capture; slow clients are disconnected instead of accumulating video. The browser uses a relative `<img>` URL inside the existing Edge app sandbox. Runtime credentials stay on the server.
 
+Each viewer has a 15-second lease renewed by its status checks. Pause closes that viewer through an authenticated request; abandoned connections expire even when a browser keeps an old image request open. One user cannot stop or renew another user's viewer.
+
 SDK contract `1.1` prevents installation on older Edge versions without the camera broker. There is no host device mount, privileged container, separate login, outbound network permission or new Box service.
 
 ## Release
@@ -56,7 +58,7 @@ For the first release, the GHCR package must be public. Verify an anonymous pull
 
 ## Verification boundary
 
-Automated tests cover authenticated routes, camera selection, multipart frames, shared viewers, disconnect cleanup and failure states. The Edge capture helper is checked against Linux V4L2 structures and controlled device responses. **No physical C270 was connected during development.** A first-device check should confirm live video, unplug/reconnect, permission revocation and stopping the last viewer. The example supports single-planar UVC MJPEG capture; other camera formats are not converted.
+Automated tests cover authenticated routes, camera selection, multipart frames, shared viewers, owned viewer leases, disconnect cleanup and failure states. Real Chromium and GTK WebKit checks exercise the Edge proxy, pause/resume and JPEGs without Huffman tables. The Edge capture helper is checked against Linux V4L2 structures and controlled device responses. **No physical C270 was connected during development.** A first-device check should confirm live video, unplug/reconnect, permission revocation and stopping the last viewer. The example supports single-planar UVC MJPEG capture; other camera formats are not converted.
 
 References: [Logitech C270 specifications](https://www.logitech.com/en-us/products/webcams/c270-hd-webcam.960-000694.html), [Linux V4L2 streaming I/O](https://docs.kernel.org/userspace-api/media/v4l/mmap.html), [Orenda SDK hardware guide](https://github.com/OrendaNet/OrendaBoxSDK/blob/main/docs/hardware.md).
 

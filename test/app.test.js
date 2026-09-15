@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { once } = require('node:events');
+const { randomBytes } = require('node:crypto');
 const { createApp, PROFILE } = require('../server');
 
 const id = 'usb-' + '1'.repeat(32);
@@ -30,7 +31,7 @@ async function fixture(t, options = {}) {
   } };
   const original = runtime.usb.cameraStream;
   runtime.usb.cameraStream = (...args) => { requests.push(args); return original(...args); };
-  const server = createApp({ runtime, secret });
+  const server = createApp({ runtime, secret, viewerLeaseMs: options.viewerLeaseMs });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -40,18 +41,22 @@ async function fixture(t, options = {}) {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   });
-  const request = (route, init = {}) => fetch(base + route, { headers, ...init });
+  const request = (route, { raw = false, ...init } = {}) => {
+    if (!raw && route.startsWith('/api/stream?') && !route.includes('viewer=')) route += '&viewer=' + randomBytes(16).toString('hex');
+    return fetch(base + route, { headers, ...init });
+  };
   const view = async (camera = id) => {
     const controller = new AbortController();
+    const viewer = randomBytes(16).toString('hex');
     viewers.push(controller);
-    const response = await request(`/api/stream?camera=${camera}`, { signal: controller.signal });
-    return { response, controller };
+    const response = await request(`/api/stream?camera=${camera}&viewer=${viewer}`, { signal: controller.signal });
+    return { response, controller, viewer };
   };
   return { request, view, streams, requests, server };
 }
 
 async function until(predicate) {
-  for (let attempt = 0; attempt < 100; attempt++) {
+  for (let attempt = 0; attempt < 250; attempt++) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -225,4 +230,88 @@ test('a nonmultipart camera response is rejected and its upstream is aborted', a
   assert.equal(response.status, 503);
   assert.equal(settings.signal.aborted, true);
   assert.match((await response.json()).error, /camera is unavailable/);
+});
+
+test('a stream requires an unpredictable viewer id', async (t) => {
+  const app = await fixture(t);
+  for (const viewer of ['', 'short', 'f'.repeat(31), 'F'.repeat(32), '../stop']) {
+    const response = await app.request(`/api/stream?camera=${id}&viewer=${encodeURIComponent(viewer)}`, { raw: true });
+    assert.equal(response.status, 400);
+    await response.arrayBuffer();
+  }
+  assert.equal(app.requests.length, 0);
+});
+
+test('only the viewer owner can stop that viewer and other viewers keep their capture', async (t) => {
+  const app = await fixture(t);
+  const first = await app.view();
+  const second = await app.view();
+  for (const intruder of [{ ...headers, 'x-orenda-username': 'intruder' }, { ...headers, 'x-orenda-auth-source': 'different-source' }]) {
+    const denied = await app.request(`/api/viewers/${first.viewer}/stop`, { method: 'POST', headers: intruder });
+    assert.equal(denied.status, 404);
+    await denied.arrayBuffer();
+  }
+  assert.equal(app.streams[0].aborted, false);
+  const disconnected = assert.rejects(first.response.body.getReader().read());
+  assert.equal((await app.request(`/api/viewers/${first.viewer}/stop`, { method: 'POST' })).status, 204);
+  await disconnected;
+  assert.equal(app.streams[0].aborted, false);
+  assert.equal((await app.request(`/api/viewers/${first.viewer}/stop`, { method: 'POST' })).status, 204);
+  assert.equal((await app.request(`/api/viewers/${second.viewer}/stop`, { method: 'POST' })).status, 204);
+  await until(() => app.streams[0].aborted);
+});
+
+test('stopping before a delayed stream request prevents late capture and a fresh viewer can retry', async (t) => {
+  const app = await fixture(t);
+  const viewer = randomBytes(16).toString('hex');
+  assert.equal((await app.request(`/api/viewers/${viewer}/stop`, { method: 'POST' })).status, 204);
+  const late = await app.request(`/api/stream?camera=${id}&viewer=${viewer}`);
+  assert.ok([409, 410].includes(late.status));
+  await late.arrayBuffer();
+  assert.equal(app.requests.length, 0);
+  assert.equal((await app.view()).response.status, 200);
+  assert.equal(app.requests.length, 1);
+});
+
+test('an owner can stop a viewer while its camera is still starting', async (t) => {
+  let complete;
+  let settings;
+  let canceled = false;
+  const app = await fixture(t, { cameraStream: (_id, options) => {
+    settings = options;
+    return new Promise((resolve) => { complete = resolve; });
+  } });
+  const viewer = randomBytes(16).toString('hex');
+  const opening = app.request(`/api/stream?camera=${id}&viewer=${viewer}`);
+  const closed = assert.rejects(opening);
+  await until(() => complete);
+  assert.equal((await app.request(`/api/viewers/${viewer}/stop`, { method: 'POST' })).status, 204);
+  await closed;
+  assert.equal(settings.signal.aborted, true);
+  complete({ body: new ReadableStream({ cancel() { canceled = true; } }), contentType: 'multipart/x-mixed-replace; boundary=camera' });
+  await until(() => canceled);
+});
+
+test('expired viewers close even if the browser retains their HTTP stream', async (t) => {
+  const app = await fixture(t, { viewerLeaseMs: 100 });
+  const { response } = await app.view();
+  await assert.rejects(response.body.getReader().read());
+  await until(() => app.streams[0].aborted);
+});
+
+test('owned status heartbeats renew only their viewer and global status cannot retain abandoned viewers', async (t) => {
+  const app = await fixture(t, { viewerLeaseMs: 200 });
+  const abandoned = await app.view();
+  const active = await app.view();
+  const timer = setInterval(() => {
+    for (const suffix of ['', `&viewer=${active.viewer}`]) {
+      app.request(`/api/status?camera=${id}${suffix}`).then((response) => response.arrayBuffer()).catch(() => {});
+    }
+  }, 50);
+  t.after(() => clearInterval(timer));
+  await assert.rejects(abandoned.response.body.getReader().read());
+  assert.equal(app.streams[0].aborted, false);
+  clearInterval(timer);
+  assert.equal((await app.request(`/api/viewers/${active.viewer}/stop`, { method: 'POST' })).status, 204);
+  await until(() => app.streams[0].aborted);
 });
