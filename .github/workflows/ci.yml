@@ -19,4 +19,4 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = aarch64
           docker build -t orenda-usb-camera:check .
-          docker run --rm -v "$PWD/test:/app/test:ro" orenda-usb-camera:check node --test test
+          docker run --rm -v "$PWD/test:/app/test:ro" orenda-usb-camera:check npm test
