@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>USB Camera · Orenda</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header><a class="brand" href="./" aria-label="Orenda USB Camera home"><img src="icon.svg" width="32" height="32" alt=""><strong>Orenda</strong><span>USB Camera</span></a></header>
+  <main>
+    <div class="heading"><div><p class="eyebrow">OrendaBox example app</p><h1>A live view from your Box.</h1><p class="intro">Connect your USB camera and see what it sees.</p></div><span id="badge" class="badge">Connecting</span></div>
+    <section class="viewer" aria-label="Camera viewer">
+      <div class="toolbar"><div class="camera-field"><label for="camera">Camera</label><select id="camera" disabled><option>Looking for a camera…</option></select></div><button id="toggle" disabled>Start video</button></div>
+      <div class="screen">
+        <img id="video" alt="Live view from the USB camera connected to your OrendaBox" hidden>
+        <div id="placeholder" class="placeholder"><svg viewBox="0 0 48 48" width="48" height="48" fill="none" aria-hidden="true"><rect x="5" y="13" width="27" height="24" rx="6" stroke="currentColor" stroke-width="2"/><path d="m32 21 10-6v20l-10-6" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M13 7h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><h2 id="screen-title">Connecting to your Box</h2><p id="screen-detail">Your camera will appear here.</p></div>
+      </div>
+      <div class="footer"><span id="status" role="status" aria-live="polite">Checking your Edge Console session…</span><span class="format">640 × 480 · up to 10 fps</span></div>
+    </section>
+    <div class="below"><p>Live video only. Nothing is recorded and the microphone stays off.</p><button id="refresh" class="quiet">Refresh cameras</button></div>
+    <p id="help" class="help">Plug the Logitech C270 into your OrendaBox. During installation, allow USB read access and select the camera.</p>
+    <noscript><p class="help">Enable JavaScript to select and view the camera.</p></noscript>
+  </main>
+</body>
+</html>

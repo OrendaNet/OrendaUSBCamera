@@ -1,0 +1,17 @@
+{
+  "id": "orenda-usb-camera",
+  "name": "Orenda USB Camera",
+  "description": "View live video from a Logitech C270 USB camera connected to your OrendaBox. A simple, open-source SDK example by Orenda. No recording or microphone access.",
+  "category": "utilities",
+  "runtime": "compose",
+  "metadata": {
+    "orenda": {
+      "sdkVersion": "1.1",
+      "containerPort": 3101,
+      "healthPath": "/health",
+      "ui": { "enabled": true },
+      "capabilities": ["usb:read"]
+    }
+  },
+  "versions": []
+}
