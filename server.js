@@ -22,11 +22,11 @@ function cameraError(error) {
     400: 'This camera does not support the requested video format.',
     401: 'The app connection has expired. Reopen the app from Edge Console.',
     403: 'Camera access is not approved. Ask a Box administrator to allow USB read access for this camera.',
-    404: 'Camera support is unavailable. Update Edge Manager to 0.2.38 or later.',
+    404: 'Camera support is unavailable. Update Edge Manager to 0.2.39 or later.',
     409: 'The camera is busy or has reconnected. Close other camera apps and try again.',
     422: 'This camera does not support 640×480 MJPEG video. Select a compatible USB camera.',
     429: 'Too many camera viewers are open. Close another viewer and try again.',
-    501: 'Camera support is unavailable. Update Edge Manager to 0.2.38 or later.',
+    501: 'Camera support is unavailable. Update Edge Manager to 0.2.39 or later.',
     503: 'The camera is unavailable. Check its USB connection and access in Edge Console.',
     504: 'The camera did not send video. Check its USB connection and try again.'
   };

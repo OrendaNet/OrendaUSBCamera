@@ -6,7 +6,7 @@ Built with Node.js and ordinary HTML/CSS/JavaScript, using the [OrendaBox SDK](h
 
 ## Install on a Box
 
-1. Use DevicePlatform **0.2.46 or newer** and update Edge Manager to **0.2.38 or newer**.
+1. Use DevicePlatform **0.2.46 or newer** and update Edge Manager to **0.2.39 or newer**.
 2. Plug the C270 into the **Box**, not the computer displaying the web page.
 3. Install **Orenda USB Camera** from [Orenda Apps](https://apps.orendanet.com).
 4. Approve **USB read access** and select the camera in the installation permissions.

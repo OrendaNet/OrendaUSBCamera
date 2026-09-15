@@ -6,7 +6,7 @@ A small, open-source OrendaBox camera viewer by Orenda.
 - One camera capture shared across viewers; closes when the last viewer leaves.
 - No recording, microphone capture, external services, or npm runtime dependencies.
 
-Requires **DevicePlatform 0.2.46+ and Edge Manager 0.2.38+**. The SDK 1.1 manifest makes older Edge versions reject installation safely. Only Linux ARM64 is distributed.
+Requires **DevicePlatform 0.2.46+ and Edge Manager 0.2.39+**. The SDK 1.1 manifest makes older Edge versions reject installation safely. Only Linux ARM64 is distributed. Version 0.1.1 corrects the required Edge version after an intervening Edge release; camera behavior is unchanged.
 
 Connect the C270 to the Box, install from Orenda Apps, approve USB read access and select the camera, then open the app through Edge Console or OrendaConnect.
 
