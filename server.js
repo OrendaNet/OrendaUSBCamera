@@ -2,14 +2,14 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { authenticateEdgeRequest, createRuntimeClient } = require('./sdk');
-const { JpegParts } = require('./stream');
+const { JpegParts, writeJpegFrame } = require('./stream');
 
 const PROFILE = Object.freeze({ width: 640, height: 480, fps: 10 });
 const CAMERA_ID = /^usb-[a-f0-9]{32}$/;
 const VIEWER_ID = /^[a-f0-9]{32}$/;
 const BOUNDARY = 'orenda-camera';
 const MAX_VIEWERS = 8;
-const MAX_QUEUED_BYTES = 1024 * 1024;
+const MODES = Object.freeze([{ id: 'standard', label: 'Standard', fps: 10 }, { id: 'data-saver', label: 'Data saver', fps: 5 }]);
 const assets = new Map([
   ['/', ['text/html; charset=utf-8', 'index.html']],
   ['/app.js', ['text/javascript; charset=utf-8', 'app.js']],
@@ -23,11 +23,11 @@ function cameraError(error) {
     400: 'This camera does not support the requested video format.',
     401: 'The app connection has expired. Reopen the app from Edge Console.',
     403: 'Camera access is not approved. Ask a Box administrator to allow USB read access for this camera.',
-    404: 'Camera support is unavailable. Update Edge Manager to 0.2.39 or later.',
+    404: 'Camera support is unavailable. Update Edge Manager to 0.2.41 or later.',
     409: 'The camera is busy or has reconnected. Close other camera apps and try again.',
     422: 'This camera does not support 640×480 MJPEG video. Select a compatible USB camera.',
-    429: 'Too many camera viewers are open. Close another viewer and try again.',
-    501: 'Camera support is unavailable. Update Edge Manager to 0.2.39 or later.',
+    429: 'The camera or viewer limit is reached. Pause another camera or close another viewer and try again.',
+    501: 'Camera support is unavailable. Update Edge Manager to 0.2.41 or later.',
     503: 'The camera is unavailable. Check its USB connection and access in Edge Console.',
     504: 'The camera did not send video. Check its USB connection and try again.'
   };
@@ -42,6 +42,32 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
   const responseViewers = new WeakMap();
   const closedViewers = new Map();
   const ownerOf = (user) => JSON.stringify([user.source, user.id]);
+  function batchBody(req) {
+    return new Promise((resolve, reject) => {
+      let size = 0;
+      const chunks = [];
+      const finish = (error, value) => {
+        clearTimeout(timer);
+        req.removeListener('data', data);
+        req.removeListener('end', end);
+        req.removeListener('error', aborted);
+        req.removeListener('aborted', aborted);
+        if (error) { req.resume(); reject(error); } else resolve(value);
+      };
+      const data = (chunk) => {
+        size += chunk.length;
+        if (size > 8192) return finish(Object.assign(new Error('Status request is too large.'), { status: 413 }));
+        chunks.push(chunk);
+      };
+      const end = () => {
+        try { finish(null, JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch (_) { finish(Object.assign(new Error('Invalid status request.'), { status: 400 })); }
+      };
+      const aborted = () => finish(Object.assign(new Error('Status request interrupted.'), { status: 400 }));
+      const timer = setTimeout(() => finish(Object.assign(new Error('Status request timed out.'), { status: 408 })), 5000);
+      req.on('data', data).once('end', end).once('error', aborted).once('aborted', aborted);
+    });
+  }
   function rememberClosed(id) {
     const now = Date.now();
     for (const [key, until] of closedViewers) if (until <= now) closedViewers.delete(key);
@@ -49,6 +75,8 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
     closedViewers.set(id, now + 15000);
   }
   function releaseViewer(viewer) {
+    if (viewer.closed) return;
+    viewer.closed = true;
     if (viewers.get(viewer.id) === viewer) viewers.delete(viewer.id);
     rememberClosed(viewer.id);
     viewer.hub.clients.delete(viewer.res);
@@ -83,15 +111,31 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
     stopHub(hub);
   }
   function sendFrame(hub, jpeg) {
-    const part = Buffer.concat([
-      Buffer.from(`--${BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\n\r\n`), jpeg, Buffer.from('\r\n')
-    ]);
-    hub.lastFrameAt = Date.now();
-    hub.latest = part;
+    const header = Buffer.from(`--${BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\n\r\n`);
+    const frame = { header, jpeg };
+    const now = Date.now();
+    hub.lastFrameAt = now;
+    hub.latest = frame;
     for (const res of hub.clients) {
-      if (res.destroyed || res.writableLength + part.length > MAX_QUEUED_BYTES) { res.destroy(); continue; }
-      res.write(part);
+      const viewer = responseViewers.get(res);
+      if (viewer) writeJpegFrame(viewer, frame, releaseViewer, now);
     }
+  }
+  function viewerStatus(id, viewerId, user, renew = true) {
+    const viewer = viewerId ? viewers.get(viewerId) : null;
+    if (viewer && (viewer.owner !== ownerOf(user) || viewer.hub.id !== id)) throw Object.assign(new Error('Viewer not found.'), { status: 404 });
+    const failure = failures.get(id);
+    if (viewerId && (!viewer || viewer.expiresAt <= Date.now())) {
+      if (viewer) releaseViewer(viewer);
+      return { state: 'idle', error: failure?.message || null, errorCode: failure?.status || null, fps: 0, lastFrameAgeMs: null };
+    }
+    if (viewer && renew) viewer.expiresAt = Date.now() + viewerLeaseMs;
+    const hub = hubs.get(id);
+    const capturedAt = hub?.lastFrameAt || 0;
+    const frameAt = viewer ? Math.min(capturedAt, viewer.lastSentAt) : capturedAt;
+    const lastFrameAgeMs = frameAt ? Math.max(0, Date.now() - frameAt) : null;
+    return { state: failure ? 'error' : frameAt ? 'live' : hub ? 'connecting' : 'idle', error: failure?.message || null,
+      errorCode: failure?.status || null, fps: lastFrameAgeMs !== null && lastFrameAgeMs < 2000 ? viewer?.fps || 0 : 0, lastFrameAgeMs };
   }
   function getHub(id) {
     let hub = hubs.get(id);
@@ -109,7 +153,7 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
         try {
           for await (const chunk of response.body) {
             if (hub.stopped) break;
-            for (const frame of parser.push(Buffer.from(chunk))) sendFrame(hub, frame);
+            for (const frame of parser.push(chunk)) sendFrame(hub, frame);
           }
           if (!hub.stopped) recordFailure(hub, { status: 503 });
         } catch (error) { recordFailure(hub, error); }
@@ -144,13 +188,42 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
         res.writeHead(204, { 'Cache-Control': 'no-store' });
         return res.end();
       }
+      if (req.method === 'POST' && url.pathname === '/api/status') {
+        if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) return json(res, 415, { error: 'Send a JSON status request.' });
+        try {
+          const body = await batchBody(req);
+          if (!body || !Array.isArray(body.viewers) || body.viewers.length > 16 || Object.keys(body).some(key => key !== 'viewers')) throw Object.assign(new Error('Invalid status request.'), { status: 400 });
+          const seen = new Set();
+          for (const item of body.viewers) {
+            if (!item || !CAMERA_ID.test(item.camera || '') || !VIEWER_ID.test(item.viewer || '') || seen.has(item.viewer) || Object.keys(item).some(key => !['camera', 'viewer', 'fps'].includes(key)) || (item.fps !== undefined && ![5, 10].includes(item.fps))) throw Object.assign(new Error('Invalid viewer.'), { status: 400 });
+            seen.add(item.viewer);
+            // Check the entire batch before renewing any leases.
+            const viewer = viewers.get(item.viewer);
+            if (viewer && (viewer.owner !== ownerOf(user) || viewer.hub.id !== item.camera)) throw Object.assign(new Error('Viewer not found.'), { status: 404 });
+          }
+          return json(res, 200, { viewers: body.viewers.map(({ camera, viewer, fps }) => {
+            const current = viewers.get(viewer);
+            if (current && fps !== undefined && current.targetFps !== fps) {
+              current.targetFps = fps;
+              current.sentFrames = 0;
+              current.fps = 0;
+              current.rateStartedAt = Date.now();
+            }
+            return { camera, viewer, ...viewerStatus(camera, viewer, user) };
+          }) });
+        } catch (error) {
+          if ([408, 413].includes(error.status)) res.setHeader('Connection', 'close');
+          return json(res, error.status || 400, { error: error.message });
+        }
+      }
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed.' });
       if (url.pathname === '/api/session') return json(res, 200, { user });
       if (url.pathname === '/api/cameras') {
         try {
-          const result = await runtime.usb.devices();
+          const [result, context] = await Promise.all([runtime.usb.devices(), Promise.resolve().then(() => runtime.context?.()).catch(() => null)]);
           const cameras = (result.devices || []).filter((device) => device.type === 'camera' && device.read).map(({ id, name }) => ({ id, name }));
-          return json(res, 200, { cameras, profile: PROFILE });
+          const maxConcurrentCameras = context?.services?.usb?.maxConcurrentCameraStreams >= 2 ? 2 : 1;
+          return json(res, 200, { cameras, profile: PROFILE, limits: { maxConcurrentCameras, maxViewersPerCamera: MAX_VIEWERS }, modes: MODES });
         } catch (error) { const failure = cameraError(error); return json(res, failure.status, { error: failure.message }); }
       }
       if (url.pathname === '/api/stream' || url.pathname === '/api/status') {
@@ -158,26 +231,21 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
         if (!CAMERA_ID.test(id || '')) return json(res, 400, { error: 'Choose an approved camera.' });
         if (url.pathname === '/api/status') {
           const viewerId = url.searchParams.get('viewer');
-          if (viewerId !== null) {
-            if (!VIEWER_ID.test(viewerId)) return json(res, 400, { error: 'Invalid viewer.' });
-            const viewer = viewers.get(viewerId);
-            if (viewer && (viewer.owner !== ownerOf(user) || viewer.hub.id !== id)) return json(res, 404, { error: 'Viewer not found.' });
-            if (!viewer) return json(res, 200, { state: 'idle', error: failures.get(id)?.message || null });
-            if (viewer.expiresAt <= Date.now()) { releaseViewer(viewer); return json(res, 200, { state: 'idle', error: null }); }
-            viewer.expiresAt = Date.now() + viewerLeaseMs;
-          }
-          const hub = hubs.get(id);
-          const failure = failures.get(id);
-          return json(res, 200, { state: failure ? 'error' : hub?.lastFrameAt ? 'live' : hub ? 'connecting' : 'idle', error: failure?.message || null });
+          if (viewerId !== null && !VIEWER_ID.test(viewerId)) return json(res, 400, { error: 'Invalid viewer.' });
+          try { return json(res, 200, viewerStatus(id, viewerId, user)); }
+          catch (error) { return json(res, error.status, { error: error.message }); }
         }
         try {
           const viewerId = url.searchParams.get('viewer');
           if (!VIEWER_ID.test(viewerId || '')) return json(res, 400, { error: 'Invalid viewer.' });
+          const fps = url.searchParams.get('fps') || '10';
+          if (!['5', '10'].includes(fps)) return json(res, 400, { error: 'Choose Standard or Data saver video.' });
           if (viewers.has(viewerId) || (closedViewers.get(viewerId) || 0) > Date.now()) return json(res, 409, { error: 'This viewer has closed or is already open. Start video again.' });
           const hub = getHub(id);
           if (hub.clients.size >= MAX_VIEWERS) return json(res, 429, { error: cameraError({ status: 429 }).message });
           // Reserve before awaiting the camera so simultaneous joins remain bounded.
-          const viewer = { id: viewerId, owner: ownerOf(user), hub, res, expiresAt: Date.now() + viewerLeaseMs };
+          const viewer = { id: viewerId, owner: ownerOf(user), hub, res, expiresAt: Date.now() + viewerLeaseMs,
+            targetFps: Number(fps), lastSentAt: 0, blockedAt: 0, rateStartedAt: Date.now(), sentFrames: 0, fps: 0 };
           viewers.set(viewerId, viewer);
           responseViewers.set(res, viewer);
           hub.clients.add(res);
@@ -186,7 +254,7 @@ function createApp({ runtime = createRuntimeClient(), secret = process.env.OREND
           if (res.destroyed || hub.stopped) return;
           res.writeHead(200, { 'Content-Type': `multipart/x-mixed-replace; boundary=${BOUNDARY}`, 'Cache-Control': 'no-store, no-cache, must-revalidate', 'X-Accel-Buffering': 'no', 'X-Content-Type-Options': 'nosniff' });
           res.flushHeaders();
-          if (hub.latest) res.write(hub.latest);
+          if (hub.latest) writeJpegFrame(viewer, hub.latest, releaseViewer);
           return;
         } catch (error) {
           const failure = cameraError(error);

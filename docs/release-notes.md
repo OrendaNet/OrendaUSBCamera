@@ -1,17 +1,17 @@
-A small, open-source OrendaBox camera viewer by Orenda.
+Orenda USB Camera 0.2.0 brings remote camera monitoring to phones, tablets and desktops.
 
-- Live MJPEG video targeting Logitech C270 USB webcams, at 640×480 and up to 10 fps.
-- Select an approved camera, pause/resume, and reconnect from one page.
-- Reuses Edge Console sign-in and installation-time USB read permission.
-- One camera capture shared across viewers; closes when the last viewer leaves.
-- Explicit per-viewer pause and bounded expiry work when WebKit retains an image request; another user's viewer cannot be stopped or renewed.
-- A failed image connection shows a retry state even when other viewers remain live.
-- No recording, microphone capture, external services, or npm runtime dependencies.
+- View all approved cameras in a responsive grid, with up to two cameras live at once.
+- Pause or resume individual cameras or the whole view. Timed pauses resume after 1, 5 or 15 minutes.
+- Focus on a camera without interrupting other live views.
+- Standard mode delivers up to 10 fps; Data saver delivers up to 5 fps with the same 640 × 480 view.
+- Video pauses while the page is hidden and resumes according to your previous choices.
+- Refresh connected cameras without restarting cameras that are already live.
+- Clear connection, permission, busy-camera and capacity states with retry controls.
 
-Requires **DevicePlatform 0.2.46+ and Edge Manager 0.2.39+**. The SDK 1.1 manifest makes older Edge versions reject installation safely. Only Linux ARM64 is distributed. Version 0.1.2 includes the final WebKit pause and viewer error fixes.
+Streaming reuses one capture per camera across viewers. A bounded parser copies JPEG bytes once, multipart delivery reuses those bytes, and slow viewers skip newer frames until their current frame drains. One status request covers both cameras. Runtime authorization remains checked every 500 ms without a duplicate installed-app file read.
 
-Connect the C270 to the Box, install from Orenda Apps, approve USB read access and select the camera, then open the app through Edge Console or OrendaConnect.
+Use **DevicePlatform 0.2.46+ and Edge Manager 0.2.41+** for two simultaneous cameras. The two capture slots are shared across the Box. Older camera-enabled Edge versions expose one live slot. Existing USB grants and Edge Console sign-in are preserved; no new permissions are requested.
 
-No physical camera was available during development. Automated checks use controlled JPEG streams and test the V4L2 capture contract. Real Chromium and GTK WebKit pass streaming, pause/resume and JPEGs without Huffman tables. Actual C270 negotiation and USB hotplug still need a connected Box.
+Video is live only: no recording or microphone capture. Logitech C270 is the target camera; other USB cameras must support single-planar UVC MJPEG at 640 × 480. No physical C270 was available during development. Real-device format negotiation and USB hotplug still need a connected Box.
 
-The attached manifest pins the exact signed container digest. Boxes must be able to pull it anonymously before this release is activated in Orenda Apps.
+The attached manifest pins the signed ARM64 image. Published image versions remain immutable.

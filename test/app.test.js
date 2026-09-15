@@ -16,7 +16,7 @@ async function fixture(t, options = {}) {
   const streams = [];
   const requests = [];
   const viewers = [];
-  const runtime = { usb: {
+  const runtime = { context: options.context || (async () => ({ services: { usb: { maxConcurrentCameraStreams: 2 } } })), usb: {
     devices: options.devices || (async () => ({ devices: [{ id, name: 'Logitech C270', type: 'camera', read: true }] })),
     cameraStream: options.cameraStream || (async (camera, settings) => {
       const stream = { camera, settings, aborted: false, canceled: false };
@@ -45,11 +45,11 @@ async function fixture(t, options = {}) {
     if (!raw && route.startsWith('/api/stream?') && !route.includes('viewer=')) route += '&viewer=' + randomBytes(16).toString('hex');
     return fetch(base + route, { headers, ...init });
   };
-  const view = async (camera = id) => {
+  const view = async (camera = id, fps = 10) => {
     const controller = new AbortController();
     const viewer = randomBytes(16).toString('hex');
     viewers.push(controller);
-    const response = await request(`/api/stream?camera=${camera}&viewer=${viewer}`, { signal: controller.signal });
+    const response = await request(`/api/stream?camera=${camera}&viewer=${viewer}&fps=${fps}`, { signal: controller.signal });
     return { response, controller, viewer };
   };
   return { request, view, streams, requests, server };
@@ -89,7 +89,8 @@ test('camera discovery returns only readable cameras and no host paths or unrela
   const response = await app.request('/api/cameras');
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('cache-control'), 'no-store');
-  assert.deepEqual(await response.json(), { cameras: [{ id, name: 'Logitech C270' }], profile: { width: 640, height: 480, fps: 10 } });
+  assert.deepEqual(await response.json(), { cameras: [{ id, name: 'Logitech C270' }], profile: { width: 640, height: 480, fps: 10 },
+    limits: { maxConcurrentCameras: 2, maxViewersPerCamera: 8 }, modes: [{ id: 'standard', label: 'Standard', fps: 10 }, { id: 'data-saver', label: 'Data saver', fps: 5 }] });
   assert.deepEqual(PROFILE, { width: 640, height: 480, fps: 10 });
 });
 
@@ -314,4 +315,114 @@ test('owned status heartbeats renew only their viewer and global status cannot r
   clearInterval(timer);
   assert.equal((await app.request(`/api/viewers/${active.viewer}/stop`, { method: 'POST' })).status, 204);
   await until(() => app.streams[0].aborted);
+});
+
+test('older or unavailable runtime context safely limits the monitoring layout to one camera', async (t) => {
+  for (const context of [async () => ({ services: { usb: { camera: true } } }), async () => { throw new Error('private runtime detail'); }]) {
+    const app = await fixture(t, { context });
+    const response = await app.request('/api/cameras');
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.limits.maxConcurrentCameras, 1);
+    assert.equal(body.cameras.length, 1);
+    assert.doesNotMatch(JSON.stringify(body), /private runtime/);
+  }
+});
+
+test('two cameras stream independently and stopping one leaves the other live', async (t) => {
+  const app = await fixture(t);
+  const first = await app.view(id);
+  const second = await app.view(otherId);
+  const firstReader = first.response.body.getReader();
+  const secondReader = second.response.body.getReader();
+  app.streams[0].controller.enqueue(part);
+  app.streams[1].controller.enqueue(part);
+  assert.ok(Buffer.from((await firstReader.read()).value).includes(jpeg));
+  assert.ok(Buffer.from((await secondReader.read()).value).includes(jpeg));
+  assert.deepEqual(app.streams.map(stream => stream.camera), [id, otherId]);
+  await app.request(`/api/viewers/${first.viewer}/stop`, { method: 'POST' });
+  await until(() => app.streams[0].aborted);
+  assert.equal(app.streams[1].aborted, false);
+  assert.equal((await (await app.request(`/api/status?camera=${otherId}&viewer=${second.viewer}`)).json()).state, 'live');
+});
+
+test('one batched status request renews only its owned viewers across both cameras', async (t) => {
+  const app = await fixture(t, { viewerLeaseMs: 250 });
+  const abandoned = await app.view();
+  const first = await app.view();
+  const second = await app.view(otherId);
+  const body = JSON.stringify({ viewers: [{ camera: id, viewer: first.viewer }, { camera: otherId, viewer: second.viewer }] });
+  const pulse = () => app.request('/api/status', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body });
+  const result = await (await pulse()).json();
+  assert.deepEqual(result.viewers.map(row => [row.camera, row.viewer, row.state]), [[id, first.viewer, 'connecting'], [otherId, second.viewer, 'connecting']]);
+  const timer = setInterval(() => pulse().then(response => response.arrayBuffer()).catch(() => {}), 50);
+  t.after(() => clearInterval(timer));
+  await assert.rejects(abandoned.response.body.getReader().read());
+  assert.equal(app.streams[0].aborted, false);
+  assert.equal(app.streams[1].aborted, false);
+  assert.equal((await (await pulse()).json()).viewers.length, 2);
+  assert.equal(app.requests.length, 2);
+});
+
+test('batched status validates the entire request and cannot retain or inspect another owner', async (t) => {
+  const app = await fixture(t, { viewerLeaseMs: 200 });
+  const first = await app.view();
+  const owned = { camera: id, viewer: first.viewer };
+  const post = (body, auth = headers) => app.request('/api/status', { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: typeof body === 'string' ? body : JSON.stringify(body) });
+  for (const body of ['{', {}, { viewers: null }, { viewers: [owned, owned] }, { viewers: [null] }, { viewers: [{ ...owned, fps: '5' }] }, { viewers: [{ ...owned, fps: 30 }] }, { viewers: [{ camera: '/dev/video0', viewer: first.viewer }] }, { viewers: Array.from({ length: 17 }, () => owned) }]) {
+    assert.equal((await post(body)).status, 400);
+  }
+  assert.equal((await app.request('/api/status', { method: 'POST', body: '{}' })).status, 415);
+  assert.equal((await post({ viewers: [] }, { 'x-orenda-username': 'forged' })).status, 401);
+  assert.equal((await post('x'.repeat(8193))).status, 413);
+  assert.equal((await post({ viewers: [owned] }, { ...headers, 'x-orenda-auth-source': 'another-source' })).status, 404);
+  assert.equal((await post({ viewers: [{ camera: otherId, viewer: first.viewer }] })).status, 404);
+  const timer = setInterval(() => post({ viewers: [owned] }, { ...headers, 'x-orenda-username': 'another-user' }).then(response => response.arrayBuffer()).catch(() => {}), 50);
+  t.after(() => clearInterval(timer));
+  await assert.rejects(first.response.body.getReader().read());
+  assert.equal(app.streams[0].aborted, true);
+});
+
+test('data saver changes an existing viewer rate without reconnecting or changing other viewers', async (t) => {
+  const app = await fixture(t);
+  const full = await app.view(id, 10);
+  const saver = await app.view(id, 10);
+  const changed = await app.request('/api/status', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ viewers: [{ camera: id, viewer: saver.viewer, fps: 5 }] }) });
+  assert.equal(changed.status, 200);
+  assert.equal((await changed.json()).viewers[0].viewer, saver.viewer);
+  const count = async response => {
+    let frames = 0;
+    const { JpegParts } = require('../stream');
+    const parser = new JpegParts(response.headers.get('content-type'));
+    try { for await (const chunk of response.body) for (const frame of parser.push(chunk)) { assert.deepEqual(frame, jpeg); frames++; } } catch (_) { /* Test ends the response. */ }
+    return frames;
+  };
+  const fullCount = count(full.response);
+  const saverCount = count(saver.response);
+  for (let frame = 0; frame < 12; frame++) {
+    app.streams[0].controller.enqueue(part);
+    await new Promise(resolve => setTimeout(resolve, 105));
+  }
+  full.controller.abort(); saver.controller.abort();
+  const [standardFrames, savedFrames] = await Promise.all([fullCount, saverCount]);
+  assert.ok(standardFrames >= 10, String(standardFrames));
+  assert.ok(savedFrames >= 5 && savedFrames <= 7, String(savedFrames));
+  assert.ok(savedFrames < standardFrames);
+  assert.equal(app.requests.length, 1);
+  for (const fps of ['0', '30', '5.0', '-1', 'abc']) assert.equal((await app.request(`/api/stream?camera=${id}&fps=${fps}`)).status, 400);
+});
+
+test('a maximum-size valid JPEG reaches a viewer without the multipart overhead exceeding its bound', async (t) => {
+  const app = await fixture(t);
+  const { response } = await app.view();
+  const { JpegParts } = require('../stream');
+  const parser = new JpegParts(response.headers.get('content-type'));
+  const large = Buffer.alloc(1024 * 1024, 23);
+  large.writeUInt16BE(0xffd8, 0); large.writeUInt16BE(0xffd9, large.length - 2);
+  app.streams[0].controller.enqueue(Buffer.concat([Buffer.from(`--fixture-camera\r\nContent-Type: image/jpeg\r\nContent-Length: ${large.length}\r\n\r\n`), large, Buffer.from('\r\n')]));
+  for await (const chunk of response.body) {
+    const frames = [...parser.push(chunk)];
+    if (frames.length) { assert.deepEqual(frames[0], large); break; }
+  }
 });

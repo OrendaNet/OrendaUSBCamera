@@ -8,7 +8,7 @@ ENV NODE_ENV=production HOST=0.0.0.0 PORT=3101
 USER node
 LABEL org.opencontainers.image.source="https://github.com/OrendaNet/OrendaUSBCamera"
 LABEL org.opencontainers.image.title="Orenda USB Camera"
-LABEL org.opencontainers.image.description="A simple OrendaBox USB camera viewer and SDK example"
+LABEL org.opencontainers.image.description="Remote USB camera monitoring for OrendaBox with mobile and multi-camera views"
 LABEL org.opencontainers.image.licenses="MIT"
 EXPOSE 3101
 CMD ["node", "server.js"]

@@ -1,4 +1,4 @@
-# Orenda USB Camera example
+# Orenda USB Camera
 
 Read `../OrendaDocs/AGENTS.md` and the OrendaBoxSDK hardware and auth contracts before changing integration.
 
