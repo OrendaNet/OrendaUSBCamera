@@ -1,10 +1,17 @@
 {
   "name": "orenda-usb-camera",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Remote USB camera monitoring for OrendaBox, with multiple live views and mobile controls.",
   "license": "MIT",
   "repository": "github:OrendaNet/OrendaUSBCamera",
-  "scripts": { "start": "node server.js", "dev": "node sdk/dev.js", "test": "node --test test/*.test.js", "check": "node --check server.js && node --check stream.js && node --check public/app.js" },
-  "engines": { "node": ">=20.3" }
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node sdk/dev.js",
+    "test": "node --test test/*.test.js",
+    "check": "node --check server.js && node --check stream.js && node --check public/app.js"
+  },
+  "engines": {
+    "node": ">=20.3"
+  }
 }
